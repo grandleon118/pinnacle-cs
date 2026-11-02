@@ -96,27 +96,53 @@ def _keys():
     return _KEYS
 
 
+def _key_list():
+    """候选 key 列表：环境变量优先，再内置，去重（内置两个 key 可能被写成同一个值）。"""
+    env = (os.environ.get('PIN_KEY') or '').strip()
+    out = []
+    for k in ([env] if env else []) + [DEFAULT_KEY] + list(ALT_KEYS):
+        k = (k or '').strip()
+        if k and k not in out:
+            out.append(k)
+    return out
+
+
+_COOLDOWN_UNTIL = 0.0
+
+
 def pin_get(path, **kw):
-    """带 API key 自动轮换的请求：401/403 视为 key 失效，换下一个再试。"""
-    global _KEY_I
+    """
+    带 key 轮换的请求。
+
+    关键：403/401 **不等于** key 永久失效 —— Pinnacle 的 403 也可能是短时限流/风控
+    （实测高密度请求后出现，几分钟后同 key 又恢复）。所以：
+      1) 同一 key 先轻微退避重试（http_json 内部已有退避）；
+      2) 仍 40x 才换下一个 key；
+      3) 全部 40x 则整体冷却 45s 并重置指针，让后续场次还有机会，
+         而不是把进程级状态钉死在「全部失效」——那会让一轮里剩下的场次全部报废。
+    """
+    global _KEY_I, _COOLDOWN_UNTIL
+    keys = _key_list()
+    if not keys:
+        return None, '没有可用的 API key'
+    if time.time() < _COOLDOWN_UNTIL:
+        time.sleep(min(45.0, _COOLDOWN_UNTIL - time.time()))
     last = None
-    for _ in range(len(_keys())):
-        key = _keys()[_KEY_I % len(_keys())]
-        raw = path
-        d, err = http_json(BASE + raw, headers={
-            'X-API-Key': key, 'Referer': 'https://www.pinnacle.com/'}, **kw)
+    for step in range(len(keys)):
+        idx = (_KEY_I + step) % len(keys)
+        d, err = http_json(BASE + path, headers={
+            'X-API-Key': keys[idx], 'Referer': 'https://www.pinnacle.com/'}, **kw)
         if d is not None:
-            k = key[:6] + '…'
-            if not os.environ.get('_PIN_KEY_OK') and _KEY_I:
-                print('    API key 轮换生效，当前使用 %s' % k)
-            os.environ['_PIN_KEY_OK'] = key
+            _KEY_I = idx
+            os.environ['_PIN_KEY_OK'] = keys[idx]
             return d, None
         last = err
-        if err and err.startswith('HTTP 40'):
-            _KEY_I += 1
-            continue
-        return None, err
-    return None, 'API key 全部失效（%s）' % last
+        if not (err and err.startswith('HTTP 40')):
+            return None, err
+        time.sleep(2.0)
+    _COOLDOWN_UNTIL = time.time() + 45.0
+    _KEY_I = 0
+    return None, 'HTTP 40x 连续失败（%s）——疑似限流，冷却 45s' % last
 
 
 # ---------------------------------------------------------------- 数值
@@ -619,9 +645,16 @@ def snapshot(date_str=None, hours=96, max_ml=120, quiet=False):
                         'pin_home': pm['home'], 'pin_away': pm['away'],
                         'pin_start': pm['bj'], 'pair_dist': dist, 'pair_how': how})
             sp, e1 = find_cs_special(pm['id'], quiet=True)
+            if sp is None and e1 and 'HTTP 40' in str(e1):
+                # 限流抖动：等冷却结束再给这场一次机会，别直接记 no_cs
+                time.sleep(20)
+                sp, e1 = find_cs_special(pm['id'], quiet=True)
             time.sleep(0.4)
             if sp:
                 cs, e2 = fetch_cs(sp, pm['home'], pm['away'], quiet=True)
+                if cs is None and e2 and 'HTTP 40' in str(e2):
+                    time.sleep(20)
+                    cs, e2 = fetch_cs(sp, pm['home'], pm['away'], quiet=True)
                 time.sleep(0.4)
                 if cs:
                     grid_p = {k: v['p'] for k, v in cs['grid'].items()}
@@ -779,9 +812,13 @@ def main(argv):
     else:
         write_snapshot(payloads, dry_run='--dry-run' in a)
         tot = sum(p['cs_ok'] for p in payloads.values())
-        print('  本轮共取到 %d 场全网格比分盘' % tot)
+        want = sum(p['jc_total'] for p in payloads.values())
+        print('  本轮共取到 %d 场全网格比分盘（竞彩共 %d 场）' % (tot, want))
         if tot == 0:
-            print('  ⚠ 一场都没抓到——检查 PIN_KEY 是否失效（secrets.PIN_KEY）')
+            print('  ⚠ 一场都没抓到——检查 PIN_KEY 是否失效（secrets.PIN_KEY），或被限流')
+        elif want and tot / want < 0.6:
+            print('  ⚠ 成功率偏低（%.0f%%）——多半是 Pinnacle 限流，下一轮会自动补'
+                  % (100.0 * tot / want))
     if '--dry-run' not in a:
         prune(days=prune_days)
     return 0

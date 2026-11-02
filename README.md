@@ -1,14 +1,17 @@
 # Pinnacle 比分盘 · GitHub 中转采集
 
 国内直连 `guest.api.arcadia.pinnacle.com` 被 SNI 级拦截（同一 Cloudflare IP 换 SNI 就通，
-说明不是限流）。这个目录用 GitHub 的境外 runner 绕过这一层：**runner 抓、仓库存、本地读**。
+说明不是限流）。这个目录用 GitHub 的境外 runner 绕过这一层：**本地推赛程、runner 抓盘、仓库存、本地读**。
 
 ```
-GitHub Actions（每 30 分钟）
-  fetch_cs.py ──► data/2026-11-02/0945.json
-                        │
-              api.github.com（实测可达）
-                        ▼
+本地 push_fixtures.py（每天跑 1–2 次）
+  └─► fixtures/{业务日}.json ──git push──► 仓库
+                                            │
+GitHub Actions（每 30 分钟）                  │
+  fetch_cs.py 读 fixtures/ + 直连 Pinnacle ──┴─► data/2026-11-02/1727.json
+                                                        │
+                                          api.github.com（实测可达）
+                                                        ▼
 本地 pinnacle_import.py
   ──► archive/pinnacle/{date}_open.json / _close.json / _drift.json
   ──► archive/{date}_pinnacle比分.csv      31 档 × pin / jc / EV
@@ -16,40 +19,13 @@ GitHub Actions（每 30 分钟）
   ──► Pinnacle比分_累计.csv                长表，一行一档
 ```
 
-## 一次性配置（5 分钟）
+## 一次性配置（已完成）
 
-1. 在 GitHub 新建一个 **public** 仓库（公开仓库的 Actions 分钟免费且不限），名字随意，
-   例如 `pinnacle-cs`。不要勾选 README / .gitignore / license。
-2. 把本目录内容推上去（在 `github_relay/` 里执行）：
+仓库：https://github.com/grandleon118/pinnacle-cs （public）
 
-   ```bash
-   git init -b main
-   git add -A
-   git -c user.name=me -c user.email=me@example.com commit -m "init"
-   git remote add origin https://github.com/<你的账号>/pinnacle-cs.git
-   git push -u origin main
-   ```
-
-   `.github/workflows/pinnacle-cs.yml` 必须在仓库根目录，push 后 Actions 会自动启用。
-
-3. （可选）仓库 → Settings → Secrets and variables → Actions → New repository secret，
-   名字 `PIN_KEY`，值是 Pinnacle 的 guest API key。不设置就用脚本内置的默认 key。
-
-4. 仓库 → Actions → `pinnacle-cs` → Run workflow，手动跑一次确认能出数据。
-   跑完仓库里应出现 `data/<今天>/<HHMM>.json`。
-
-5. 本地填仓库地址（二选一）：
-
-   ```bash
-   # 方式 A：写进配置文件
-   cp github_relay/config.example.json github_relay/config.json
-   # 然后编辑 config.json，把 repo 改成 "你的账号/pinnacle-cs"
-
-   # 方式 B：环境变量
-   set PIN_GH_REPO=你的账号/pinnacle-cs
-   ```
-
-6. 验证：
+1. 本地已填好 `config.json`（`repo: grandleon118/pinnacle-cs`）。
+2. `PIN_KEY` 未设置，用脚本内置 key；失效时自动轮换，全部失效才报错。
+3. 验证：
 
    ```bash
    python tools/pinnacle_import.py --list
@@ -59,21 +35,31 @@ GitHub Actions（每 30 分钟）
 ## 日常用法
 
 ```bash
-python tools/daily_archive.py                 # auto：有中转配置走中转，否则直连
+python tools/push_fixtures.py                       # 导出今明两天竞彩赛程并推送（先跑这个）
+python tools/daily_archive.py                       # auto：有中转配置走中转，否则直连
 python tools/daily_archive.py --pin-source relay    # 强制走中转
 python tools/pinnacle_import.py --date 2026-11-02   # 单独补某一天
 python tools/pinnacle_import.py --list              # 看仓库里攒了哪些天
 ```
 
-## 为什么 runner 能自己知道该抓哪几场
+## 为什么赛程要从本地推（重要）
 
-`webapi.sporttery.cn` 的官方赛程接口在境外可直连，返回 `businessDate` / `编号` /
-开赛时间 / 胜平负赔率。所以：
+最初的设计是让 runner 自己调竞彩官方接口确定场次，**实测不通**：
 
-- **不需要**你本地推送清单，runner 自己就能确定当天竞彩有哪些场次；
-- 配对用「开赛时间精确到分钟」，同分钟多场时用去水后的 1X2 概率做组内全局贪心；
-- 队名从不用中英对照表——配对成功后把「中文队名 → 英文队名」记进
-  `data/cache/teams.json`，下次直接命中，零网络开销；
+```
+webapi.sporttery.cn  →  runner（Azure 机房 IP）  返回 HTTP 567
+```
+
+567 是它的风控验证页。同一请求从本机发出是 200，差别只在来源 IP。
+所以职责切开：**本机负责赛程（fixtures/），runner 只负责抓 Pinnacle**。
+
+runner 端仍然保留「仓库里没有当天赛程就直连官方接口」的兜底，但机房 IP 上基本拿不到，
+见到 `竞彩赛程抓取失败：HTTP 567` 就是 fixtures 没推或已过期。
+
+配对本身不依赖中英队名对照表：
+
+- 主键是「开赛时间精确到分钟」，同分钟多场时用去水后的 1X2 概率做组内全局贪心；
+- 配对成功后把「中文队名 → 英文队名」记进 `data/cache/teams.json`，下次直接命中；
 - 1X2 价格缓存在 `data/cache/moneyline.json`，同一场次跨 30 分钟复用，不重复请求。
 
 ## 已知限制
