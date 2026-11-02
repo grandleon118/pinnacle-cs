@@ -1,0 +1,39 @@
+name: diag
+
+# 一次性诊断：确认 runner 侧哪些上游域名真的可达。
+# 结论出来后本文件即可删除。
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: 探活
+        env:
+          PIN_KEY_ENV: ${{ secrets.PIN_KEY }}
+        run: |
+          UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36'
+          probe () {  # name url [extra curl args...]
+            local name="$1"; local url="$2"; shift 2
+            local out
+            out=$(curl -s -m 25 -A "$UA" -o /tmp/body.$$ -w "%{http_code} %{size_download}" "$@" "$url" 2>/dev/null)
+            printf '%-22s %s  %s\n' "$name" "$out" "$(head -c 110 /tmp/body.$$ | tr -d '\n' | tr -s ' ')"
+          }
+          echo "runner IP: $(curl -s -m 10 https://api.ipify.org || echo '?')"
+          echo "---"
+          probe sporttery 'https://webapi.sporttery.cn/gateway/jc/football/getMatchCalculatorV1.qry?poolCode=hhad,had&channel=c' -H 'Referer: https://www.sporttery.cn/'
+          probe sporttery_home 'https://www.sporttery.cn/'
+          probe 500_trade 'https://trade.500.com/jczq/' -H 'Referer: https://trade.500.com/'
+          probe 500_odds 'https://www.500.com/static/public/jczq/xml/hisdata/2026/1101/odds.xml'
+          KEY="${PIN_KEY_ENV:-CmX2KcMrXuFmNg6YFbmTxE0y9CIrOi0R}"
+          probe pinnacle_sports 'https://guest.api.arcadia.pinnacle.com/0.1/sports' -H "X-API-Key: $KEY" -H 'Accept: application/json' -H 'Referer: https://www.pinnacle.com/'
+          probe pinnacle_www 'https://www.pinnacle.com/'
+          echo "---"
+          echo "=== pinnacle/sports 前 200 字:"
+          curl -s -m 25 'https://guest.api.arcadia.pinnacle.com/0.1/sports' -H "X-API-Key: $KEY" -H 'Accept: application/json' | head -c 200
+          echo
