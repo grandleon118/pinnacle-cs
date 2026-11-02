@@ -634,26 +634,33 @@ def snapshot(date_str=None, hours=96, max_ml=120, quiet=False):
 
     out = {}
     ok = 0
+    streak = 0          # 连续被限流的场次数
+    throttled = 0
     for mt in jcs:
         rec = {'编号': mt['编号'], '联赛': mt['联赛'], '主队': mt['主队'],
                '客队': mt['客队'], '开赛': mt['开赛'], 'jc_had': mt['had'],
                '状态': 'no_match'}
         pr = pairs.get(mt['编号'])
-        if pr:
+        if pr and streak < 3:
             pm, dist, how = pr
             rec.update({'状态': 'no_cs', 'pin_id': pm['id'], 'pin_league': pm['league'],
                         'pin_home': pm['home'], 'pin_away': pm['away'],
                         'pin_start': pm['bj'], 'pair_dist': dist, 'pair_how': how})
             sp, e1 = find_cs_special(pm['id'], quiet=True)
             if sp is None and e1 and 'HTTP 40' in str(e1):
-                # 限流抖动：等冷却结束再给这场一次机会，别直接记 no_cs
-                time.sleep(20)
+                # 限流抖动：给这场一次机会，但绝不无限重试（下一轮 cron 会补）
+                time.sleep(8)
                 sp, e1 = find_cs_special(pm['id'], quiet=True)
+                if sp is None:
+                    streak += 1
+                    throttled += 1
+            elif sp:
+                streak = 0
             time.sleep(0.4)
             if sp:
                 cs, e2 = fetch_cs(sp, pm['home'], pm['away'], quiet=True)
                 if cs is None and e2 and 'HTTP 40' in str(e2):
-                    time.sleep(20)
+                    time.sleep(8)
                     cs, e2 = fetch_cs(sp, pm['home'], pm['away'], quiet=True)
                 time.sleep(0.4)
                 if cs:
@@ -673,6 +680,13 @@ def snapshot(date_str=None, hours=96, max_ml=120, quiet=False):
                     rec['note'] = e2
             else:
                 rec['note'] = e1
+        elif pr:
+            # 已连续 3 场被限流：放弃本轮剩余请求，交给下一轮 cron 补
+            pm = pr[0]
+            rec.update({'状态': 'throttled', 'pin_id': pm['id'],
+                        'pin_home': pm['home'], 'pin_away': pm['away'],
+                        'note': '连续限流，本轮跳过'})
+            throttled += 1
         out.setdefault(mt['业务日'], []).append(rec)
 
     payloads = {}
