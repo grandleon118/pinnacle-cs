@@ -651,11 +651,6 @@ def snapshot(date_str=None, hours=96, max_ml=120, quiet=False):
                 # 限流抖动：给这场一次机会，但绝不无限重试（下一轮 cron 会补）
                 time.sleep(8)
                 sp, e1 = find_cs_special(pm['id'], quiet=True)
-                if sp is None:
-                    streak += 1
-                    throttled += 1
-            elif sp:
-                streak = 0
             time.sleep(0.4)
             if sp:
                 cs, e2 = fetch_cs(sp, pm['home'], pm['away'], quiet=True)
@@ -680,6 +675,15 @@ def snapshot(date_str=None, hours=96, max_ml=120, quiet=False):
                     rec['note'] = e2
             else:
                 rec['note'] = e1
+            # 统一算限流：不管卡在「找比分盘」还是「取比分盘」，只要原因是 40x 就累计；
+            # 成功或非限流原因则清零。
+            if rec.get('状态') == 'ok':
+                streak = 0
+            elif rec.get('note') and 'HTTP 40' in str(rec.get('note')):
+                streak += 1
+                throttled += 1
+            else:
+                streak = 0
         elif pr:
             # 已连续 3 场被限流：放弃本轮剩余请求，交给下一轮 cron 补
             pm = pr[0]
