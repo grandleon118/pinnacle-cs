@@ -7,8 +7,10 @@ Pinnacle 全网格比分盘 · GitHub Actions 采集端
 本地用 pinnacle_import.py 通过 api.github.com / raw.githubusercontent.com 读回。
 
 为什么 runner 端能自己确定抓哪几场：
-  竞彩官方赛程接口 webapi.sporttery.cn 在境外可直连，返回 businessDate / 编号 /
-  开赛时间 / had 1X2 赔率，足以和 Pinnacle 的赛程做配对，不需要本地推送清单。
+  优先读仓库里的 fixtures/{业务日}.json —— 由本地 push_fixtures.py 从竞彩官方接口
+  导出后推送（本地网络能正常访问 webapi.sporttery.cn）。
+  兜底才直连 webapi.sporttery.cn：该域名对机房/境外 IP 会返回 HTTP 567 风控页，
+  runner 上通常拿不到，所以只作为「仓库里没有当天赛程」时的尝试。
 
 配对（不依赖中英队名对照表）：
   1) 开赛时间精确到分钟 —— 同一分钟有多场时进第 2 步
@@ -36,6 +38,7 @@ UA = ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
 ROOT = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(ROOT, 'data')
 CACHE = os.path.join(DATA, 'cache')
+FIX = os.path.join(ROOT, 'fixtures')
 
 SP_URL = ('https://webapi.sporttery.cn/gateway/jc/football/'
           'getMatchCalculatorV1.qry?poolCode=hhad,had&channel=c')
@@ -227,6 +230,66 @@ def jc_1x2(mt):
         return None
     p, _ = devig({'h': mt['had']['h'], 'd': mt['had']['d'], 'a': mt['had']['a']})
     return p or None
+
+
+# ---------------------------------------------------------------- 赛程来源
+def repo_fixtures(dates=None, quiet=False):
+    """
+    读仓库里的 fixtures/{业务日}.json —— 本地 push_fixtures.py 从竞彩官方接口导出后推送。
+    文件缺失/损坏只跳过，不抛错。返回 (matches, 成功读到的业务日列表)。
+    """
+    try:
+        names = sorted(os.listdir(FIX))
+    except Exception:
+        return [], []
+    out, got = [], []
+    for fn in names:
+        if not fn.endswith('.json'):
+            continue
+        day = fn[:-5]
+        if dates and day not in dates:
+            continue
+        try:
+            d = json.load(open(os.path.join(FIX, fn), encoding='utf-8'))
+        except Exception as e:
+            if not quiet:
+                print('  fixtures/%s 读取失败：%s' % (fn, e))
+            continue
+        ok = 0
+        for x in d.get('matches') or []:
+            try:
+                kick = datetime.datetime.strptime(x['开赛'], '%Y-%m-%d %H:%M')
+            except Exception:
+                continue
+            had = x.get('had')
+            if had:
+                try:
+                    had = {'h': float(had['h']), 'd': float(had['d']), 'a': float(had['a'])}
+                except Exception:
+                    had = None
+            out.append({'编号': x.get('编号') or '', '业务日': day, '开赛': x['开赛'],
+                        '联赛': x.get('联赛') or '', '主队': x.get('主队') or '',
+                        '客队': x.get('客队') or '', 'had': had,
+                        '状态': x.get('状态') or '', '_kick': kick})
+            ok += 1
+        if ok:
+            got.append(day)
+    return out, got
+
+
+def load_jc(dates=None, quiet=False):
+    """赛程：仓库文件优先，缺失才兜底官方接口。返回 (matches, 来源, err)。"""
+    m, got = repo_fixtures(dates, quiet=quiet)
+    if m:
+        if not quiet:
+            print('  赛程来源：fixtures/（%s，共 %d 场）' % (','.join(got), len(m)))
+        return m, 'fixtures/(%s)' % ','.join(got), None
+    if not quiet:
+        print('  仓库无 fixtures，尝试直连 webapi.sporttery.cn（机房 IP 可能被 567 拦）…')
+    m2, err = jc_matches(quiet=quiet)
+    if m2 is None:
+        return None, None, err
+    return m2, 'webapi.sporttery.cn', None
 
 
 # ---------------------------------------------------------------- Pinnacle 赛程
@@ -515,9 +578,9 @@ def fetch_cs(special, parent_home, parent_away, quiet=True):
 def snapshot(date_str=None, hours=96, max_ml=120, quiet=False):
     """抓一轮快照，返回 {业务日: payload}。"""
     now_cst = datetime.datetime.now(CST)
-    jcs, err = jc_matches(quiet=quiet)
+    jcs, jc_src, err = load_jc([date_str] if date_str else None, quiet=quiet)
     if jcs is None:
-        return None, '竞彩赛程抓取失败：%s' % err
+        return None, '竞彩赛程抓取失败（fixtures/ 无当日文件且官方接口不可用）：%s' % err
     # 只保留未开赛的（开赛后 Pinnacle 会把比分盘下架）
     jcs = [m for m in jcs
            if m['_kick'] > now_cst.replace(tzinfo=None) + datetime.timedelta(minutes=2)]
@@ -585,7 +648,7 @@ def snapshot(date_str=None, hours=96, max_ml=120, quiet=False):
             'date': bd,
             'snapshot': now_cst.strftime('%Y-%m-%d %H:%M'),
             'snapshot_utc': datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
-            'source': 'guest.api.arcadia.pinnacle.com CS markets + webapi.sporttery.cn 赛程',
+            'source': 'guest.api.arcadia.pinnacle.com CS markets + 竞彩赛程 %s' % jc_src,
             '口径': 'Pinnacle 全网格按比例去水后聚合竞彩 31 档；覆盖率<0.97 表示盘面截断',
             'jc_total': len(recs),
             'paired': sum(1 for r in recs if r['状态'] in ('ok', 'no_cs')),
