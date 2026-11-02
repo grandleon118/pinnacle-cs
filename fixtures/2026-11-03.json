@@ -1,6 +1,6 @@
 {
  "date": "2026-11-03",
- "exported": "2026-11-02 17:33",
+ "exported": "2026-11-02 18:18",
  "source": "webapi.sporttery.cn getMatchCalculatorV1",
  "说明": "本地导出；runner 只读此文件，不再直连竞彩接口",
  "count": 8,
