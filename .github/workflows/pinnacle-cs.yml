@@ -1,0 +1,71 @@
+name: pinnacle-cs
+
+# 每 30 分钟一轮快照。Pinnacle 不提供历史，初盘→临盘的漂移只能靠自己按时间切片攒。
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  # 手动改 README 之类的提交也会顺手跑一轮；机器人自己的 data/ 提交被忽略，避免自激循环
+  push:
+    paths-ignore:
+      - "data/**"
+  workflow_dispatch:
+    inputs:
+      date:
+        description: "业务日 YYYY-MM-DD（留空=今天及次日）"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+# 同一时刻只跑一个；不取消进行中的，避免丢掉半截快照
+concurrency:
+  group: pinnacle-cs
+  cancel-in-progress: false
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 抓快照
+        env:
+          PIN_KEY: ${{ secrets.PIN_KEY }}
+          IN_DATE: ${{ github.event.inputs.date }}
+        run: |
+          set -o pipefail
+          ARGS="--prune-days 45"
+          if [ -n "$IN_DATE" ]; then ARGS="$ARGS --date $IN_DATE"; fi
+          python fetch_cs.py $ARGS | tee /tmp/run.log
+          {
+            echo "### Pinnacle CS 快照 $(date -u +%FT%TZ)"
+            echo '```'
+            cat /tmp/run.log
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 提交
+        run: |
+          set -e
+          git config user.name  "pinnacle-bot"
+          git config user.email "pinnacle-bot@users.noreply.github.com"
+          mkdir -p data
+          git add -A
+          if git diff --cached --quiet; then
+            echo "无变化，跳过提交"
+            exit 0
+          fi
+          git commit -m "data: snapshot $(date -u +%Y-%m-%dT%H:%MZ)"
+          for i in 1 2 3 4; do
+            git pull --rebase --autostash origin "${GITHUB_REF_NAME}" && git push && exit 0
+            echo "push 冲突，重试 $i"; sleep 6
+          done
+          echo "push 连续失败"; exit 1

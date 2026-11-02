@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+*.log
+# 本地配置（仓库名/分支），用 config.example.json 作模板
+config.json
